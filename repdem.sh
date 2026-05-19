@@ -1025,7 +1025,8 @@ collect_system_state() {
 
     # Machine-id
     local _mid
-    _mid=$(cat /etc/machine-id 2>/dev/null | tr -d '[:space:]')
+    #_mid=$(cat /etc/machine-id 2>/dev/null | tr -d '[:space:]')
+    _mid=$(tr -d '[:space:]' </etc/machine-id 2>/dev/null)
     _SYS_STATE[MACHINE_ID]="${_mid:-unknown}"
 
     # Init system
@@ -1233,7 +1234,7 @@ generate_raw_report() {
     report_command "cat /etc/fstab"
     report_command "command -v genfstab"
     report_command "zramctl --output-all"
-    #report_command "cat /sys/block/zram*/comp_algorithm"
+    report_command "cat /sys/block/zram*/comp_algorithm"
     report_command "ls /sys/block/zram0 > /dev/null 2>&1 && cat /sys/block/zram*/comp_algorithm || echo 'zram non activé'"
     report_command "swapon --show"
     report_command "findmnt --fstab --raw"
@@ -2325,7 +2326,8 @@ _validate_bls_entries() {
     fi
 
     local _machine_id
-    _machine_id=$(cat /etc/machine-id 2>/dev/null | tr -d '[:space:]')
+    #_machine_id=$(cat /etc/machine-id 2>/dev/null | tr -d '[:space:]')
+    _mid=$(</etc/machine-id tr -d '[:space:]' 2>/dev/null)
     local _errors=0
     local _repaired=0
 
@@ -2468,7 +2470,7 @@ _validate_luks_tpm2_config() {
 }
 
 #-------------------------------------------------------------------------------
-# HELPERS INITRAMFS (appelés par repair_initramfs)
+# HELPERS INITRAMFS
 #-------------------------------------------------------------------------------
 
 _repair_initramfs_dracut() {
@@ -2511,21 +2513,23 @@ _repair_initramfs_debian() {
 }
 
 _validate_initramfs_present() {
-    local _kver="${1:-$(uname -r)}"
+    local _kver
+    _kver="$(uname -r)"
     for _ipath in \
         "/boot/initrd.img-${_kver}" \
         "/boot/initramfs-${_kver}.img" \
         "/boot/initramfs-${_kver}+.img" \
         "/boot/initrd"; do
         if [[ -f "$_ipath" && -s "$_ipath" ]]; then
-            log_success "Initramfs présent : $_ipath ($(du -sh "$_ipath" 2>/dev/null | cut -f1))"
+            local _size
+            _size=$(du -sh "$_ipath" 2>/dev/null | cut -f1)
+            log_success "Initramfs présent : $_ipath (${_size:-?})"
             return 0
         fi
     done
     log_warning "Aucun initramfs trouvé pour le noyau ${_kver} — le système pourrait ne pas démarrer"
     return 1
 }
-
 repair_initramfs() {
     if is_operation_completed "initramfs_repair"; then
         log_info "Régénération initramfs déjà effectuée durant cette session"
@@ -3208,7 +3212,8 @@ _check_crypttab_suffix() {
 
     echo ""
     echo "Contenu actuel de /etc/crypttab :"
-    cat /etc/crypttab | while read -r l; do printf '  %s\n' "$l"; done
+    #cat /etc/crypttab | while read -r l; do printf '  %s\n' "$l"; done
+    while read -r l; do printf '  %s\n' "$l"; done </etc/crypttab
     echo ""
 
     local fixed=false
@@ -3310,7 +3315,9 @@ _create_sd_boot_entry() {
 
     log_success "Entrée boot créée : $entry_file"
     echo ""
-    cat "$entry_file" | while read -r l; do printf '  %s\n' "$l"; done
+    #cat "$entry_file" | while read -r l; do printf '  %s\n' "$l"; done
+    while read -r l; do printf '  %s\n' "$l"; done <"$entry_file"
+
     echo ""
 }
 
@@ -5961,12 +5968,20 @@ _autochroot_cleanup() {
         "${target}/boot"
     )
     for sub in "${submounts[@]}"; do
-        mountpoint -q "$sub" 2>/dev/null &&
-            { umount -lf "$sub" 2>/dev/null && log_info "  Démonté : $sub"; } || true
+        if mountpoint -q "$sub" 2>/dev/null; then
+            if umount -lf "$sub" 2>/dev/null; then
+                log_info "  Démonté : $sub"
+            fi
+        fi
     done
-    mountpoint -q "$target" 2>/dev/null &&
-        { umount -lf "$target" 2>/dev/null && log_success "Partition root démontée : $target"; } || true
+
+    if mountpoint -q "$target" 2>/dev/null; then
+        if umount -lf "$target" 2>/dev/null; then
+            log_success "Partition root démontée : $target"
+        fi
+    fi
     CHROOT_TARGET=""
+
 }
 
 #-------------------------------------------------------------------------------
