@@ -5137,6 +5137,7 @@ repair_filesystem_health() {
     return 0
 }
 
+# shellcheck disable=SC2120  # $1 est optionnel, valeur par défaut "false"
 repair_grub() {
     local noninteractive="${1:-false}"
     log_subheader "Réparation du chargeur GRUB"
