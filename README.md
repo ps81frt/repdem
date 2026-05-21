@@ -1,5 +1,25 @@
 # Rep-Dem
 
+[
+
+![Licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)
+
+](LICENSE)
+[
+
+![Bash](https://img.shields.io/badge/bash-4.0%2B-green.svg)
+
+](repdem.sh)
+[
+
+![Version](https://img.shields.io/badge/version-2.2.0-orange.svg)
+
+](repdem.sh)
+[
+
+![Script](https://img.shields.io/badge/télécharger-repdem.sh-brightgreen)
+
+](https://raw.githubusercontent.com/ps81frt/repdem/main/repdem.sh)
 **Version:** 2.2.0 · **Licence:** MIT · **Auteur:** ps81frt
 
 Script Bash de réparation du bootloader Linux, sans interface graphique.  
