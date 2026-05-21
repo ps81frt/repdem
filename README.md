@@ -17,9 +17,10 @@
 ](repdem.sh)
 [
 
-![Script](https://img.shields.io/badge/télécharger-repdem.sh-brightgreen)
+![Télécharger](https://img.shields.io/badge/télécharger-repdem.sh-brightgreen)
 
 ](https://raw.githubusercontent.com/ps81frt/repdem/main/repdem.sh)
+
 **Version:** 2.2.0 · **Licence:** MIT · **Auteur:** ps81frt
 
 Script Bash de réparation du bootloader Linux, sans interface graphique.  
