@@ -1794,10 +1794,24 @@ reinstall_grub_debian() {
     # ===== FIN GESTION BTRFS =====
 
     log_info "Regenerating GRUB configuration..."
-    update-grub 2>&1 || {
-        log_error "Échec de update-grub"
-        return 1
-    }
+    local _ug_out _ug_rc
+    _ug_out=$(update-grub 2>&1)
+    _ug_rc=$?
+    echo "$_ug_out" | while read -r l; do log_info "$l"; done
+
+    local _cfg_path="/boot/grub/grub.cfg"
+    if [[ $_ug_rc -ne 0 ]] || _grub_cfg_is_empty "$_cfg_path"; then
+        log_error "Échec de update-grub ou grub.cfg généré vide"
+        echo ""
+        printf "%b\n" "${YELLOW}${BOLD}╔══════════════════════════════════════════════════════════════════╗${NC}"
+        printf "%b\n" "${YELLOW}${BOLD}║  DIAGNOSTIC AUTOMATIQUE GRUB-MKCONFIG                            ║${NC}"
+        printf "%b\n" "${YELLOW}${BOLD}╚══════════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        log_info "Lancement du diagnostic pour identifier la cause du fichier vide..."
+        echo ""
+        diagnose_and_fix_grub_mkconfig
+        return $?
+    fi
 
     return 0
 }
@@ -2839,7 +2853,7 @@ install_repair_dependencies() {
     debian)
         if [[ "$boot_mode" == "uefi" ]]; then
             case "$_machine" in
-            x86_64) required_packages+=(grub-efi-amd64 grub-efi-amd64-signed shim-signed efibootmgr) ;;
+            x86_64) required_packages+=(grub-efi-amd64 grub-efi-amd64-signed shim-signed efibootmgr grub-common grub2-common shim-signed) ;;
             aarch64 | arm64) required_packages+=(grub-efi-arm64 grub-efi-arm64-signed shim-signed efibootmgr) ;;
             armv7l) required_packages+=(grub-efi-arm efibootmgr) ;;
             *) required_packages+=(grub-efi efibootmgr) ;;
@@ -4758,6 +4772,610 @@ configure_grub_menu_options() {
     fi
 }
 
+#-------------------------------------------------------------------------------
+# MODULE : DIAGNOSTIC GRUB-MKCONFIG (grub.cfg vide ou syntaxe invalide)
+#-------------------------------------------------------------------------------
+
+_grub_cfg_is_empty() {
+    local cfg="$1"
+    [[ ! -f "$cfg" ]] && return 0
+    grep -qE '^\s*(menuentry|set |echo |insmod )' "$cfg" && return 1
+    return 0
+}
+
+_reinstall_grub_d_scripts() {
+    # Force la réinstallation des scripts /etc/grub.d/ même si le répertoire existe
+    log_info "Forçage de la réinstallation des scripts /etc/grub.d/..."
+
+    local grub_d="/etc/grub.d"
+
+    # 1. Sauvegarder le contenu actuel si non vide
+    if [[ -d "$grub_d" ]]; then
+        local bak_dir="${BACKUP_DIR}/grub.d-backup-$(date +%H%M%S)"
+        mkdir -p "$bak_dir"
+        cp -a "$grub_d/". "$bak_dir/" 2>/dev/null || true
+        log_info "Contenu actuel sauvegardé : $bak_dir"
+        # Supprimer le répertoire pour forcer dpkg à le recréer
+        rm -rf "$grub_d"
+        log_info "/etc/grub.d supprimé pour forcer dpkg"
+    fi
+
+    # 2. Réinstaller les paquets qui fournissent /etc/grub.d/
+    local pkgs_to_reinstall=""
+    case "$DISTRO_FAMILY" in
+    debian)
+        # Détecter quel paquet GRUB est installé
+        if dpkg -l grub-efi-amd64 2>/dev/null | grep -q '^ii'; then
+            pkgs_to_reinstall="grub-common grub-efi-amd64 grub2-common grub-efi-amd64-signed shim-signed"
+        elif dpkg -l grub-efi-arm64 2>/dev/null | grep -q '^ii'; then
+            pkgs_to_reinstall="grub-common grub-efi-arm64"
+        elif dpkg -l grub-pc 2>/dev/null | grep -q '^ii'; then
+            pkgs_to_reinstall="grub-common grub-pc"
+        else
+            pkgs_to_reinstall="grub-common"
+        fi
+        log_info "Réinstallation : $pkgs_to_reinstall"
+        # shellcheck disable=SC2086
+        apt-get install --reinstall -y $pkgs_to_reinstall 2>&1 |
+            while read -r l; do log_debug "$l"; done
+        ;;
+    rhel)
+        dnf reinstall -y grub2-common 2>&1 | while read -r l; do log_debug "$l"; done
+        ;;
+    arch)
+        pacman -S --noconfirm grub 2>&1 | while read -r l; do log_debug "$l"; done
+        ;;
+    suse)
+        zypper install --force grub2 2>&1 | while read -r l; do log_debug "$l"; done
+        ;;
+    esac
+
+    # 3. Vérifier que les scripts essentiels sont bien là
+    local missing_scripts=()
+    for s in "00_header" "10_linux" "30_os-prober"; do
+        [[ ! -f "$grub_d/$s" ]] && missing_scripts+=("$s")
+    done
+
+    if [[ ${#missing_scripts[@]} -gt 0 ]]; then
+        log_warning "Scripts toujours manquants après réinstallation : ${missing_scripts[*]}"
+
+        # 4. Extraction directe depuis le cache dpkg (fallback)
+        log_info "Tentative d'extraction depuis le cache dpkg..."
+        local cache_dir="/var/cache/apt/archives"
+        local extracted=false
+
+        for deb in "${cache_dir}"/grub-common_*.deb "${cache_dir}"/grub2-common_*.deb; do
+            [[ -f "$deb" ]] || continue
+            local tmp_extract
+            tmp_extract=$(mktemp -d)
+            if dpkg-deb -x "$deb" "$tmp_extract" 2>/dev/null; then
+                if [[ -d "$tmp_extract/etc/grub.d" ]]; then
+                    cp -a "$tmp_extract/etc/grub.d/." "$grub_d/"
+                    log_success "Scripts extraits depuis $(basename "$deb")"
+                    extracted=true
+                fi
+            fi
+            rm -rf "$tmp_extract"
+            [[ "$extracted" == true ]] && break
+        done
+
+        if [[ "$extracted" == false ]]; then
+            # 5. Dernier recours : télécharger et extraire
+            log_warning "Cache dpkg vide — tentative de téléchargement..."
+            case "$DISTRO_FAMILY" in
+            debian)
+                apt-get download grub-common 2>/dev/null && {
+                    local deb_file
+                    deb_file=$(ls grub-common_*.deb 2>/dev/null | head -1)
+                    if [[ -f "$deb_file" ]]; then
+                        local tmp2
+                        tmp2=$(mktemp -d)
+                        dpkg-deb -x "$deb_file" "$tmp2" 2>/dev/null
+                        [[ -d "$tmp2/etc/grub.d" ]] && cp -a "$tmp2/etc/grub.d/." "$grub_d/"
+                        rm -rf "$tmp2" "$deb_file"
+                        log_success "Scripts extraits via téléchargement"
+                        extracted=true
+                    fi
+                }
+                ;;
+            esac
+        fi
+
+        if [[ "$extracted" == false ]]; then
+            log_error "Impossible de récupérer les scripts /etc/grub.d/"
+            return 1
+        fi
+    fi
+
+    # 6. S'assurer que tous les scripts sont exécutables
+    local fixed_count=0
+    for s in "$grub_d"/[0-9]*; do
+        [[ -f "$s" ]] || continue
+        if [[ ! -x "$s" ]]; then
+            chmod +x "$s"
+            fixed_count=$((fixed_count + 1))
+        fi
+    done
+    [[ $fixed_count -gt 0 ]] && log_success "$fixed_count script(s) rendus exécutables"
+
+    log_success "$(ls "$grub_d"/ | wc -l) scripts présents dans /etc/grub.d/"
+    ls "$grub_d"/ | while read -r s; do
+        local x_flag="x"
+        [[ ! -x "$grub_d/$s" ]] && x_flag="-"
+        printf "  [%s] %s\n" "$x_flag" "$s"
+    done
+    return 0
+}
+
+diagnose_and_fix_grub_mkconfig() {
+    log_header "DIAGNOSTIC GRUB-MKCONFIG"
+
+    local grub_default="/etc/default/grub"
+    local grub_d="/etc/grub.d"
+    local grub_cfg="/boot/grub/grub.cfg"
+    [[ -f /boot/grub2/grub.cfg && ! -f "$grub_cfg" ]] && grub_cfg="/boot/grub2/grub.cfg"
+
+    local fixed=false
+
+    # ── 1. État du grub.cfg actuel ───────────────────────────────────────────
+    log_subheader "1/6 — État du grub.cfg actuel"
+    if _grub_cfg_is_empty "$grub_cfg"; then
+        printf "%b\n" "${RED}  ✗ $grub_cfg est vide ou ne contient aucune commande de boot${NC}"
+    else
+        local nb_entries
+        nb_entries=$(grep -c '^\s*menuentry' "$grub_cfg" 2>/dev/null || echo 0)
+        printf "%b\n" "${GREEN}  ✔ $grub_cfg valide — $nb_entries entrée(s) menuentry${NC}"
+    fi
+
+    # ── 2. Syntaxe /etc/default/grub ────────────────────────────────────────
+    log_subheader "2/6 — Syntaxe de $grub_default"
+    if [[ ! -f "$grub_default" ]]; then
+        log_error "$grub_default absent — recréation d'un fichier par défaut"
+        backup_file "$grub_default" 2>/dev/null || true
+        cat >"$grub_default" <<'GRUB_DEFAULT_EOF'
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=10
+GRUB_DISTRIBUTOR="Linux"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"
+GRUB_CMDLINE_LINUX=""
+GRUB_DEFAULT_EOF
+        log_success "$grub_default recréé"
+        fixed=true
+    else
+        local parse_errors
+        parse_errors=$(bash -n "$grub_default" 2>&1)
+        if [[ -n "$parse_errors" ]]; then
+            log_error "Erreur de syntaxe dans $grub_default :"
+            echo "$parse_errors" | while read -r l; do printf "  %s\n" "$l"; done
+            if confirm_action "Réinitialiser $grub_default avec des valeurs sûres ?" yes; then
+                backup_file "$grub_default" "grub default config"
+                cat >"$grub_default" <<'GRUB_DEFAULT_EOF'
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=10
+GRUB_DISTRIBUTOR="Linux"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"
+GRUB_CMDLINE_LINUX=""
+GRUB_DEFAULT_EOF
+                log_success "$grub_default réinitialisé"
+                fixed=true
+            fi
+        else
+            log_success "$grub_default — syntaxe OK"
+            grep -v '^#' "$grub_default" | grep -v '^[[:space:]]*$' |
+                while read -r l; do printf "  %s\n" "$l"; done
+        fi
+    fi
+
+    # ── 3. kdump-tools.cfg ──────────────────────────────────────────────────
+    log_subheader "3/6 — kdump-tools.cfg"
+    local kdump_cfg="/etc/default/grub.d/kdump-tools.cfg"
+    if [[ -f "$kdump_cfg" ]]; then
+        local kdump_errors
+        kdump_errors=$(bash -n "$kdump_cfg" 2>&1)
+        if [[ -n "$kdump_errors" ]]; then
+            log_error "Syntaxe invalide dans $kdump_cfg :"
+            echo "$kdump_errors" | while read -r l; do printf "  %s\n" "$l"; done
+            if confirm_action "Désactiver $kdump_cfg (renommage en .disabled) ?" yes; then
+                backup_file "$kdump_cfg" "kdump-tools.cfg"
+                mv "$kdump_cfg" "${kdump_cfg}.disabled"
+                log_success "$kdump_cfg désactivé"
+                fixed=true
+            fi
+        else
+            log_success "kdump-tools.cfg — syntaxe OK"
+        fi
+    else
+        log_info "Pas de kdump-tools.cfg"
+    fi
+
+    # ── 4. Scripts /etc/grub.d/ ─────────────────────────────────────────────
+    log_subheader "4/6 — Scripts /etc/grub.d/"
+
+    local grub_d_missing=false
+    local grub_d_empty=false
+
+    if [[ ! -d "$grub_d" ]]; then
+        grub_d_missing=true
+    else
+        local script_count
+        script_count=$(find "$grub_d" -maxdepth 1 -type f | wc -l)
+        [[ "$script_count" -eq 0 ]] && grub_d_empty=true
+    fi
+
+    if [[ "$grub_d_missing" == true || "$grub_d_empty" == true ]]; then
+        if [[ "$grub_d_missing" == true ]]; then
+            log_error "/etc/grub.d/ absent — grub-mkconfig ne peut rien générer"
+        else
+            log_error "/etc/grub.d/ existe mais est VIDE — grub-mkconfig génère un fichier vide"
+            log_info "Note : apt --reinstall ne repeuple pas un répertoire existant vide."
+            log_info "La fonction de réinstallation forcée supprime d'abord le répertoire."
+        fi
+        echo ""
+        if confirm_action "Forcer la réinstallation complète des scripts /etc/grub.d/ ?" yes; then
+            if _reinstall_grub_d_scripts; then
+                fixed=true
+            else
+                log_error "Réinstallation de /etc/grub.d/ échouée"
+                return 1
+            fi
+        fi
+    else
+        # Vérifier 10_linux
+        local linux_script="${grub_d}/10_linux"
+        if [[ ! -f "$linux_script" ]]; then
+            log_error "${grub_d}/10_linux introuvable — aucune entrée noyau ne sera générée"
+            if confirm_action "Forcer la réinstallation pour restaurer 10_linux ?" yes; then
+                _reinstall_grub_d_scripts && fixed=true
+            fi
+        else
+            if [[ ! -x "$linux_script" ]]; then
+                log_warning "$linux_script non exécutable — correction"
+                chmod +x "$linux_script"
+                fixed=true
+            fi
+            log_success "$linux_script présent et exécutable"
+        fi
+
+        # Afficher tous les scripts et détecter les invalides
+        echo ""
+        printf "  %-40s  %s\n" "Script" "État"
+        echo "  ─────────────────────────────────────────────────────"
+        local bad_scripts=()
+        for s in "${grub_d}/"*; do
+            [[ -f "$s" ]] || continue
+            local s_name s_state
+            s_name=$(basename "$s")
+            if [[ -x "$s" ]]; then
+                if head -1 "$s" 2>/dev/null | grep -q 'bash\|sh'; then
+                    local s_err
+                    s_err=$(bash -n "$s" 2>&1)
+                    if [[ -n "$s_err" ]]; then
+                        s_state="${RED}✗ SYNTAXE INVALIDE${NC}"
+                        bad_scripts+=("$s")
+                    else
+                        s_state="${GREEN}✔ OK${NC}"
+                    fi
+                else
+                    s_state="${GREEN}✔ OK${NC}"
+                fi
+            else
+                s_state="${YELLOW}⊘ non exécutable (ignoré)${NC}"
+            fi
+            printf "  %-40s  %b\n" "$s_name" "$s_state"
+        done
+
+        if [[ ${#bad_scripts[@]} -gt 0 ]]; then
+            echo ""
+            log_warning "${#bad_scripts[@]} script(s) invalide(s)"
+            for bs in "${bad_scripts[@]}"; do
+                bash -n "$bs" 2>&1 | while read -r l; do printf "  %s\n" "$l"; done
+            done
+            if confirm_action "Désactiver les scripts invalides (chmod -x) ?" yes; then
+                for bs in "${bad_scripts[@]}"; do
+                    chmod -x "$bs"
+                    log_success "Désactivé : $(basename "$bs")"
+                done
+                fixed=true
+            fi
+        fi
+    fi
+
+    # ── 5. Noyaux dans /boot ────────────────────────────────────────────────
+    log_subheader "5/6 — Noyaux dans /boot"
+    local vmlinuz_count
+    vmlinuz_count=$(find /boot -maxdepth 1 \( -name 'vmlinuz*' -o -name 'vmlinux-*' \) 2>/dev/null | wc -l)
+    if [[ "$vmlinuz_count" -eq 0 ]]; then
+        log_error "Aucun noyau dans /boot — grub-mkconfig génère un fichier vide"
+        echo ""
+        echo "  C'est la cause directe de 'ne contient aucune commande'."
+        echo ""
+        if confirm_action "Réinstaller le noyau courant ($(uname -r)) ?" yes; then
+            case "$DISTRO_FAMILY" in
+            debian)
+                apt-get install --reinstall -y "linux-image-$(uname -r)" 2>&1 |
+                    while read -r l; do log_debug "$l"; done ||
+                    apt-get install -y linux-image-generic 2>&1 |
+                    while read -r l; do log_debug "$l"; done
+                ;;
+            rhel) dnf reinstall -y kernel 2>&1 | while read -r l; do log_debug "$l"; done ;;
+            arch) pacman -S --noconfirm linux 2>&1 | while read -r l; do log_debug "$l"; done ;;
+            esac
+            fixed=true
+        fi
+    else
+        log_success "$vmlinuz_count noyau(x) dans /boot :"
+        find /boot -maxdepth 1 \( -name 'vmlinuz*' -o -name 'vmlinux-*' \) 2>/dev/null |
+            sort | while read -r k; do printf "  %s\n" "$k"; done
+    fi
+
+    # ── 6. Relance grub-mkconfig ────────────────────────────────────────────
+    log_subheader "6/6 — Régénération grub.cfg"
+    echo ""
+    if confirm_action "Relancer grub-mkconfig / update-grub maintenant ?" yes; then
+        local mkconfig_out mkconfig_rc
+        local cfg_target="$grub_cfg"
+        echo ""
+        log_info "Lancement..."
+        if command_exists update-grub; then
+            mkconfig_out=$(update-grub 2>&1)
+            mkconfig_rc=$?
+        elif command_exists grub-mkconfig; then
+            mkconfig_out=$(grub-mkconfig -o "$cfg_target" 2>&1)
+            mkconfig_rc=$?
+        elif command_exists grub2-mkconfig; then
+            cfg_target="/boot/grub2/grub.cfg"
+            mkconfig_out=$(grub2-mkconfig -o "$cfg_target" 2>&1)
+            mkconfig_rc=$?
+        else
+            log_error "Aucun outil grub-mkconfig / update-grub disponible"
+            return 1
+        fi
+
+        echo "$mkconfig_out" | while read -r l; do printf "  %s\n" "$l"; done
+        echo ""
+
+        if [[ $mkconfig_rc -ne 0 ]] || _grub_cfg_is_empty "$cfg_target"; then
+            log_error "grub.cfg toujours vide ou invalide après correction"
+            echo ""
+            echo "  Pistes supplémentaires :"
+            echo "    • Vérifier que /boot est bien monté : findmnt /boot"
+            echo "    • Ajouter GRUB_DISABLE_OS_PROBER=false dans $grub_default"
+            echo "    • Vérifier permissions : ls -la /boot/vmlinuz*"
+            echo "    • Utiliser l'option 'Restaurer depuis un backup' dans le menu avancé"
+            return 1
+        fi
+
+        local nb_ok
+        nb_ok=$(grep -c '^\s*menuentry' "$cfg_target" 2>/dev/null || echo 0)
+        log_success "grub.cfg régénéré — $nb_ok entrée(s) boot"
+        mark_operation_completed "grub_mkconfig_ok"
+    fi
+
+    [[ "$fixed" == true ]] && log_success "Corrections appliquées."
+    return 0
+}
+
+#-------------------------------------------------------------------------------
+# MODULE : MENU DE SÉLECTION ET RESTAURATION DES BACKUPS
+#-------------------------------------------------------------------------------
+
+restore_from_backup_menu() {
+    log_header "RESTAURATION DEPUIS UN BACKUP REP-DEM"
+
+    local backup_base="/var/backup"
+    local -a backup_dirs=()
+    while IFS= read -r d; do
+        backup_dirs+=("$d")
+    done < <(find "$backup_base" -maxdepth 1 -type d -name 'Rep-Dem-*' 2>/dev/null | sort -r)
+
+    if [[ ${#backup_dirs[@]} -eq 0 ]]; then
+        log_warning "Aucun backup Rep-Dem trouvé dans $backup_base"
+        echo ""
+        echo "  Les backups sont créés automatiquement à chaque réparation dans :"
+        echo "    $backup_base/Rep-Dem-YYYYMMDD_HHMMSS/"
+        return 1
+    fi
+
+    echo ""
+    printf "%b\n" "${CYAN}${BOLD}Backups Rep-Dem disponibles :${NC}"
+    echo "────────────────────────────────────────────────────────────────────────────"
+    local i=1
+    for d in "${backup_dirs[@]}"; do
+        local dname size
+        dname=$(basename "$d")
+        size=$(du -sh "$d" 2>/dev/null | cut -f1)
+        printf "  %b[%d]%b  %-45s  %s\n" "${YELLOW}" "$i" "${NC}" "$dname" "${size:-?}"
+        i=$((i + 1))
+    done
+    echo "────────────────────────────────────────────────────────────────────────────"
+    echo ""
+
+    local chosen_num chosen_dir
+    while true; do
+        read -r -p "Numéro du backup [1-$((i - 1))] ou 0 pour annuler : " chosen_num
+        [[ "$chosen_num" == "0" ]] && return 0
+        if [[ "$chosen_num" =~ ^[0-9]+$ ]] &&
+            [[ "$chosen_num" -ge 1 && "$chosen_num" -le $((i - 1)) ]]; then
+            chosen_dir="${backup_dirs[$((chosen_num - 1))]}"
+            break
+        fi
+        log_warning "Sélection invalide"
+    done
+
+    log_info "Backup sélectionné : $(basename "$chosen_dir")"
+    echo ""
+    echo "  Contenu :"
+    echo "  ─────────────────────────────────────────────────────────────"
+    find "$chosen_dir" -type f 2>/dev/null | sort | while read -r f; do
+        local rel sz
+        rel="${f#$chosen_dir/}"
+        sz=$(du -sh "$f" 2>/dev/null | cut -f1)
+        printf "  %-55s  %s\n" "$rel" "${sz:-?}"
+    done
+    echo "  ─────────────────────────────────────────────────────────────"
+    echo ""
+
+    while true; do
+        echo "  Que souhaitez-vous restaurer ?"
+        echo ""
+        echo "  [1]  /etc/default/grub"
+        echo "  [2]  /boot/grub/grub.cfg"
+        echo "  [3]  /etc/fstab"
+        echo "  [4]  /etc/crypttab"
+        echo "  [5]  Table de partitions (sfdisk .dump)"
+        echo "  [6]  Table de partitions (sgdisk .bin)"
+        echo "  [7]  ESP (archive .tar.gz)"
+        echo "  [8]  Afficher rapport Boot-Info"
+        echo "  [9]  Retour"
+        echo ""
+        read -r -p "Choix [1-9] : " restore_choice
+
+        case "$restore_choice" in
+        1) _restore_backup_file "$chosen_dir" "etc/default/grub" "/etc/default/grub" ;;
+        2) _restore_backup_file "$chosen_dir" "boot/grub/grub.cfg" "/boot/grub/grub.cfg" ;;
+        3) _restore_backup_file "$chosen_dir" "etc/fstab" "/etc/fstab" ;;
+        4) _restore_backup_file "$chosen_dir" "etc/crypttab" "/etc/crypttab" ;;
+        5)
+            local pt_dir="${chosen_dir}/partition-tables"
+            if [[ ! -d "$pt_dir" ]]; then
+                log_error "Aucune sauvegarde de table de partitions dans ce backup"
+            else
+                echo ""
+                find "$pt_dir" -name '*.dump' 2>/dev/null | sort |
+                    while read -r f; do printf "  %s\n" "$(basename "$f")"; done
+                echo ""
+                read -r -p "Nom du fichier .dump : " dump_name
+                local dump_path="${pt_dir}/${dump_name}"
+                if [[ ! -f "$dump_path" ]]; then
+                    log_error "Fichier introuvable : $dump_path"
+                else
+                    lsblk -d -o NAME,SIZE,TYPE,MODEL 2>/dev/null | grep -v loop |
+                        awk 'NR==1{print "  "$0} NR>1{print "  /dev/"$0}'
+                    echo ""
+                    read -r -p "Disque cible (ex. /dev/sda) : " target_disk
+                    if [[ ! -b "$target_disk" ]]; then
+                        log_error "Périphérique invalide : $target_disk"
+                    elif confirm_action_level2 \
+                        "Restaurer $dump_name sur $target_disk ?" "RESTORE-PARTITION"; then
+                        if sfdisk "$target_disk" <"$dump_path"; then
+                            log_success "Table restaurée sur $target_disk"
+                            partprobe "$target_disk" 2>/dev/null ||
+                                blockdev --rereadpt "$target_disk" 2>/dev/null || true
+                        else
+                            log_error "Échec sfdisk restore"
+                        fi
+                    fi
+                fi
+            fi
+            ;;
+        6) restore_partition_table_sgdisk ;;
+        7)
+            local esp_archives
+            esp_archives=$(find "$chosen_dir" -name 'esp-backup-*.tar.gz' 2>/dev/null | head -5)
+            if [[ -z "$esp_archives" ]]; then
+                log_error "Aucune archive ESP dans ce backup"
+            else
+                echo "$esp_archives" | while read -r f; do printf "  %s\n" "$(basename "$f")"; done
+                read -r -p "Nom de l'archive : " esp_name
+                local esp_path
+                esp_path=$(find "$chosen_dir" -name "$esp_name" 2>/dev/null | head -1)
+                if [[ ! -f "$esp_path" ]]; then
+                    log_error "Archive introuvable"
+                else
+                    local esp_mount="/boot/efi"
+                    [[ -d /efi/EFI ]] && esp_mount="/efi"
+                    if confirm_action_level2 \
+                        "Restaurer ESP depuis $(basename "$esp_path") dans $esp_mount ?" "RESTORE-ESP"; then
+                        if tar -xzf "$esp_path" -C "$(dirname "$esp_mount")" 2>&1 |
+                            while read -r l; do log_debug "$l"; done; then
+                            log_success "ESP restaurée"
+                        else
+                            log_error "Échec extraction ESP"
+                        fi
+                    fi
+                fi
+            fi
+            ;;
+        8)
+            local boot_reports
+            boot_reports=$(find "$chosen_dir" -name 'boot-info*.txt' 2>/dev/null | sort)
+            if [[ -z "$boot_reports" ]]; then
+                log_warning "Aucun rapport Boot-Info dans ce backup"
+            else
+                local ri=1
+                local -a report_array=()
+                while IFS= read -r f; do
+                    report_array+=("$f")
+                    printf "  [%d]  %s\n" "$ri" "$(basename "$f")"
+                    ri=$((ri + 1))
+                done <<<"$boot_reports"
+                read -r -p "Rapport à afficher [1-$((ri - 1))] : " rnum
+                local sel_report="${report_array[$((rnum - 1))]:-}"
+                if [[ -f "$sel_report" ]]; then
+                    echo ""
+                    head -80 "$sel_report"
+                    echo ""
+                    echo "  Fichier complet : less $sel_report"
+                fi
+            fi
+            ;;
+        9) return 0 ;;
+        *) log_warning "Choix invalide" ;;
+        esac
+        echo ""
+        read -r -p "Appuyez sur Entrée pour continuer..."
+        echo ""
+    done
+}
+
+_restore_backup_file() {
+    local backup_dir="$1"
+    local relative_path="$2"
+    local target_path="$3"
+
+    local src
+    src=$(find "$backup_dir" -path "*${relative_path}*" -type f 2>/dev/null | sort | tail -1)
+
+    if [[ -z "$src" || ! -f "$src" ]]; then
+        log_error "Fichier '$relative_path' introuvable dans le backup $(basename "$backup_dir")"
+        return 1
+    fi
+
+    echo ""
+    log_info "Source  : $src"
+    log_info "Cible   : $target_path"
+    echo ""
+    head -10 "$src" | while read -r l; do printf "    %s\n" "$l"; done
+    echo ""
+
+    if confirm_action "Restaurer $target_path depuis ce backup ?" yes; then
+        if [[ -f "$target_path" ]]; then
+            local bak="${target_path}.pre-restore.$(date +%H%M%S)"
+            cp -a "$target_path" "$bak" 2>/dev/null &&
+                log_info "Version actuelle sauvegardée : $bak"
+        fi
+        mkdir -p "$(dirname "$target_path")" 2>/dev/null
+        if cp -a "$src" "$target_path"; then
+            log_success "Restauré : $target_path"
+            case "$target_path" in
+            /etc/default/grub | /boot/grub/grub.cfg | /boot/grub2/grub.cfg)
+                log_info "Pensez à relancer grub-mkconfig / update-grub"
+                ;;
+            /etc/fstab)
+                log_warning "Vérifiez les UUIDs avec 'blkid' avant de redémarrer"
+                ;;
+            /etc/crypttab)
+                log_warning "Régénérez l'initramfs : update-initramfs -u -k all"
+                ;;
+            esac
+        else
+            log_error "Échec de la restauration de $target_path"
+            return 1
+        fi
+    fi
+    return 0
+}
+
 repair_bios_mbr() {
     local boot_device="$1"
     if ! command_exists grub-install; then
@@ -5496,10 +6114,12 @@ run_advanced_repair() {
         printf "%b  %-66s  %b\n" "${BOLD}║${NC}" "9)  Gestionnaire bootloaders (GRUB/systemd-boot/rEFInd/Limine)" "${BOLD}║${NC}"
         printf "%b  %-66s  %b\n" "${BOLD}║${NC}" "10) Etat RAID / LVM" "${BOLD}║${NC}"
         printf "%b  %-66s  %b\n" "${BOLD}║${NC}" "11) Secure Boot: etat, MOK enrollment, signature EFI" "${BOLD}║${NC}"
-        printf "%b  %-66s  %b\n" "${BOLD}║${NC}" "12) Retour" "${BOLD}║${NC}"
+        printf "%b  %-66s  %b\n" "${BOLD}║${NC}" "12) Diagnostic grub-mkconfig (grub.cfg vide/invalide)" "${BOLD}║${NC}"
+        printf "%b  %-66s  %b\n" "${BOLD}║${NC}" "13) Restaurer depuis un backup Rep-Dem" "${BOLD}║${NC}"
+        printf "%b  %-66s  %b\n" "${BOLD}║${NC}" "14) Retour" "${BOLD}║${NC}"
         printf "%b\n" "${BOLD}╚══════════════════════════════════════════════════════════════════════╝${NC}"
         echo ""
-        read -r -p "Choix [1-12] : " adv_choice
+        read -r -p "Choix [1-14] : " adv_choice
         case "$adv_choice" in
         1)
             _list_disks
@@ -5676,6 +6296,12 @@ run_advanced_repair() {
             enroll_mok_key
             ;;
         12)
+            diagnose_and_fix_grub_mkconfig
+            ;;
+        13)
+            restore_from_backup_menu
+            ;;
+        14)
             unset -f _list_disks
             return 0
             ;;
