@@ -1,0 +1,1103 @@
+.\" Manpage for repdem
+.\" Contact : https://github.com/ps81frt/repdem
+.TH REPDEM 8 "2026" "repdem 2.2.0" "Commandes d'administration système"
+.
+.\" ─────────────────────────────────────────────────────────────────────────────
+.SH NOM
+.\" ─────────────────────────────────────────────────────────────────────────────
+repdem \- outil de réparation du chargeur d'amorçage Linux multi-distribution, sans interface graphique
+.
+.\" ─────────────────────────────────────────────────────────────────────────────
+.SH SYNOPSIS
+.\" ─────────────────────────────────────────────────────────────────────────────
+.B sudo repdem
+.RB [ \-\-boot ]
+.RB [ \-\-recommended ]
+.RB [ \-\-advanced ]
+.RB [ \-\-boot\-info
+.RI [ fichier ]]
+.RB [ \-\-analyze ]
+.RB [ \-\-output
+.IR fichier ]
+.RB [ \-\-live\-chroot ]
+.RB [ \-\-help ]
+.RB [ \-\-version ]
+.
+.\" ─────────────────────────────────────────────────────────────────────────────
+.SH DESCRIPTION
+.\" ─────────────────────────────────────────────────────────────────────────────
+.B repdem
+est un script Bash conçu pour diagnostiquer et réparer les chargeurs d'amorçage sur des systèmes Linux
+installés, depuis un système en fonctionnement ou depuis un environnement Live ISO.
+Il ne requiert aucune interface graphique et opère exclusivement en ligne de commande.
+
+Le script détecte automatiquement la distribution en cours d'exécution, le mode de démarrage
+(UEFI ou BIOS/Legacy), le chargeur d'amorçage actif (GRUB, systemd-boot, rEFInd, Limine),
+le système de fichiers racine (ext4, btrfs, xfs, etc.) ainsi que les configurations particulières
+(chiffrement LUKS, volumes logiques LVM, sous-volumes Btrfs, TPM2, Unified Kernel Images).
+
+Il est conçu pour intervenir dans les situations suivantes :
+.RS 4
+.IP \(bu 2
+système qui ne démarre plus après une mise à jour ou une modification de partition ;
+.IP \(bu 2
+installation d'un second système d'exploitation ayant écrasé le chargeur d'amorçage ;
+.IP \(bu 2
+reconfiguration du GRUB ou de systemd-boot après migration vers UEFI ;
+.IP \(bu 2
+régénération d'un initramfs corrompu ou absent ;
+.IP \(bu 2
+collecte d'informations système avant signalement d'un bug.
+.RE
+
+L'exécution requiert impérativement les privilèges root. Toutes les opérations modifiant le
+système sont précédées d'une confirmation explicite de l'utilisateur, et les fichiers ciblés
+sont sauvegardés avant modification dans
+.IR /var/backup/Rep\-Dem\-<horodatage>/ .
+
+.B repdem
+prend en charge les familles de distributions suivantes :
+Debian/Ubuntu/Mint/Pop!_OS/Kali et dérivés, Fedora/RHEL/Rocky/AlmaLinux/CentOS Stream,
+Arch Linux/Manjaro/EndeavourOS/Garuda et dérivés,
+openSUSE Tumbleweed/Leap/SLES, Void Linux, Gentoo/Funtoo, Alpine Linux.
+.
+.\" ─────────────────────────────────────────────────────────────────────────────
+.SH ARCHITECTURE ET FONCTIONNEMENT
+.\" ─────────────────────────────────────────────────────────────────────────────
+.SS 1. Initialisation
+Au démarrage, le script effectue les vérifications préalables suivantes :
+.RS 4
+.IP \(bu 2
+version de Bash (4.0 minimum requis) ;
+.IP \(bu 2
+présence des privilèges root (UID 0) ;
+.IP \(bu 2
+initialisation du fichier journal dans
+.I /var/log/repdem/Rep\-Dem.log
+(repli sur
+.I /var/tmp/Rep\-Dem.log
+puis
+.I /tmp/Rep\-Dem.log
+si le chemin principal est inaccessible).
+.RE
+
+.SS 2. Détection de l'environnement système
+Le script lit
+.I /etc/os-release
+pour identifier la distribution, la famille (debian, rhel, arch, suse, gentoo, void, alpine)
+et le gestionnaire de paquets correspondant. En l'absence de ce fichier, il consulte les
+fichiers de version alternatifs (
+.IR /etc/debian_version ,
+.IR /etc/redhat-release ,
+.IR /etc/arch-release ,
+etc.) ou déduit la famille par la présence des outils
+.BR apt ,
+.BR dnf ,
+.BR pacman ,
+.BR zypper ,
+.BR xbps-install .
+
+Il détecte également :
+.RS 4
+.IP \(bu 2
+le mode de démarrage (présence de
+.IR /sys/firmware/efi ) ;
+.IP \(bu 2
+le chargeur d'amorçage actif (GRUB via
+.IR /boot/grub/grub.cfg ,
+systemd-boot via
+.B bootctl
+ou
+.IR /boot/efi/loader/loader.conf ,
+rEFInd, Limine) ;
+.IP \(bu 2
+le système de fichiers racine (via
+.BR findmnt ) ;
+.IP \(bu 2
+la présence de chiffrement LUKS (
+.IR /etc/crypttab ) ;
+.IP \(bu 2
+la présence de volumes LVM ;
+.IP \(bu 2
+la présence d'un TPM2 (
+.IR /sys/class/tpm ) ;
+.IP \(bu 2
+les Unified Kernel Images (UKI) et les entrées Boot Loader Specification (BLS) ;
+.IP \(bu 2
+le système d'initialisation (systemd, OpenRC, sysvinit, upstart).
+.RE
+
+.SS 3. Flux d'exécution selon l'option
+Sans option, le script affiche un menu interactif à 7 entrées.
+Avec une option, il exécute directement la fonction correspondante.
+
+.TP
+Mode interactif guidé
+.RB ( \-\-boot )
+Enchaîne les vérifications d'environnement, affiche un résumé du système, puis exécute
+la séquence de réparation boot avec confirmation à chaque étape.
+
+.TP
+Mode réparation automatique
+.RB ( \-\-recommended )
+Exécute automatiquement une séquence de 7 étapes : génération d'un rapport Boot-Info
+initial, sauvegarde des tables de partitions (sgdisk, sfdisk, dd MBR 512 octets),
+installation des dépendances manquantes, réparation du bootloader détecté (GRUB ou
+systemd-boot, selon la distribution et les fichiers présents), régénération de l'initramfs,
+vérifications post-réparation (présence initramfs, activation getty), génération du rapport
+Boot-Info final avec upload optionnel.
+
+.TP
+Mode avancé
+.RB ( \-\-advanced )
+Présente un menu de 14 opérations indépendantes : sélection manuelle du disque cible,
+purge et réinstallation du chargeur d'amorçage, restauration de table de partitions
+(sfdisk ou sgdisk), restauration MBR Windows (ms-sys), restauration entrée EFI Microsoft,
+génération Boot-Info avec upload, réparation chroot (Live ISO), configuration du menu GRUB,
+gestionnaire de bootloaders (GRUB/systemd-boot/rEFInd/Limine), état RAID/LVM, Secure Boot
+et MOK enrollment, diagnostic grub-mkconfig, restauration depuis un backup Rep-Dem.
+
+.TP
+Génération de rapport Boot-Info
+.RB ( \-\-boot\-info )
+Génère un rapport structuré similaire à Boot-Info, enregistré dans un fichier texte.
+Propose optionnellement un envoi en ligne (paste service).
+
+.TP
+Rapport brut
+.RB ( \-\-analyze ,
+.BR \-\-output )
+Exécute uniquement la collecte d'informations système en lecture seule et affiche le résultat
+sur la sortie standard, ou l'écrit dans un fichier si
+.B \-\-output
+est précisé. Aucune modification n'est apportée au système.
+
+.TP
+Mode Live-chroot
+.RB ( \-\-live\-chroot )
+Depuis un Live ISO, parcourt les périphériques blocs disponibles pour localiser les systèmes
+Linux installés. Lit le
+.I /etc/fstab
+de chaque système cible pour monter les partitions séparées. Monte les systèmes de fichiers
+virtuels (
+.IR /dev ,
+.IR /dev/pts ,
+.IR /proc ,
+.IR /sys ,
+.IR /run ,
+.IR efivars )
+en bind-mount. Copie le script dans
+.I /tmp/Rep\-Dem/
+à l'intérieur du chroot, puis relance le script avec l'option interne
+.B \-\-inside-chroot
+via
+.BR chroot (8).
+Un handler de nettoyage (trap EXIT/INT/TERM) démonte automatiquement les systèmes de
+fichiers montés en cas d'interruption.
+
+.SS 4. Sauvegardes
+Avant toute modification, la fonction
+.B backup_file
+copie les fichiers concernés dans
+.IR /var/backup/Rep\-Dem\-<AAAAMMJJ_HHMMSS>/ ,
+en reproduisant l'arborescence d'origine. Le répertoire de sauvegarde est créé avec les
+permissions 700.
+
+.SS 5. Journalisation
+Chaque opération est horodatée et consignée dans le fichier journal avec les niveaux :
+INFO, SUCCÈS, ATTENTION, ERREUR, CONFIRMATION, DÉBOGAGE.
+Le mode débogage est activé en positionnant la variable d'environnement
+.BR DEBUG=true .
+
+.SS 6. Couleurs ANSI
+Les séquences de couleur ANSI sont désactivées automatiquement si la sortie n'est pas
+un terminal ou si la variable
+.B NO_COLOR
+est positionnée à
+.BR 1 .
+.
+.\" ─────────────────────────────────────────────────────────────────────────────
+.SH OPTIONS
+.\" ─────────────────────────────────────────────────────────────────────────────
+.TP
+.B \-\-boot
+Lance la réparation du chargeur d'amorçage en mode interactif. Chaque opération
+critique est précédée d'une confirmation explicite. Affiche au préalable un résumé
+de l'environnement détecté.
+
+.TP
+.B \-\-recommended
+Exécute une réparation automatique en 7 étapes sans intervention manuelle :
+génération d'un rapport Boot-Info initial, sauvegarde des tables de partitions,
+installation des dépendances, réparation du bootloader détecté (GRUB ou systemd-boot),
+régénération de l'initramfs, vérification post-réparation (initramfs présent, getty actif),
+génération du rapport Boot-Info final avec upload optionnel. Adapte les commandes à la
+distribution et au chargeur d'amorçage détectés. Bloque sur les systèmes ostree immutables.
+
+.TP
+.B \-\-advanced
+Affiche un menu de 14 options permettant des interventions ciblées :
+.RS 4
+.IP "1)" 4
+choix du disque cible et réinstallation de GRUB ;
+.IP "2)" 4
+purge complète des paquets GRUB puis réinstallation ;
+.IP "3)" 4
+restauration de table de partitions (sfdisk .dump ou sgdisk .bin) ;
+.IP "4)" 4
+restauration du MBR compatible Windows via
+.BR ms-sys ;
+.IP "5)" 4
+restauration de l'entrée EFI Microsoft (bootmgfw.efi) ;
+.IP "6)" 4
+génération du rapport Boot-Info avec upload optionnel en ligne ;
+.IP "7)" 4
+réparation via chroot depuis un Live ISO ;
+.IP "8)" 4
+configuration du menu GRUB (timeout, options noyau, résolution) ;
+.IP "9)" 4
+gestionnaire de bootloaders : installation, réinstallation et suppression de GRUB, systemd-boot, rEFInd, Limine ;
+.IP "10)" 4
+état RAID (mdadm) et LVM (pvs/vgs/lvs) ;
+.IP "11)" 4
+Secure Boot : état, enrôlement clé MOK, génération paire RSA-2048, signature de fichiers EFI ;
+.IP "12)" 4
+diagnostic grub-mkconfig : analyse et correction de grub.cfg vide ou invalide ;
+.IP "13)" 4
+restauration depuis un backup Rep-Dem existant (grub.cfg, fstab, crypttab, ESP, table de partitions) ;
+.IP "14)" 4
+retour.
+.RE
+
+.TP
+.BI \-\-boot\-info \ [fichier]
+Génère un rapport Boot-Info structuré. Si
+.I fichier
+est spécifié, le rapport y est écrit ; sinon il est placé dans
+.IR /var/backup/Rep\-Dem\-<horodatage>/boot\-info.txt .
+Propose un envoi optionnel en ligne.
+
+.TP
+.B \-\-analyze
+Collecte des informations système en lecture seule et les affiche sur la sortie
+standard. N'effectue aucune modification.
+
+.TP
+.BI \-\-output \ fichier
+Identique à
+.BR \-\-analyze ,
+mais redirige le rapport vers
+.IR fichier .
+Si le fichier existe, une sauvegarde est proposée avant écrasement.
+
+.TP
+.B \-\-live\-chroot
+Détecte automatiquement les systèmes Linux installés sur les disques disponibles,
+monte l'environnement cible et exécute le script dans un chroot sur le système
+sélectionné. Conçu pour être utilisé depuis un Live ISO.
+
+.TP
+.B \-\-help
+Affiche l'aide complète intégrée et quitte.
+
+.TP
+.B \-\-version
+Affiche le nom du script et son numéro de version, puis quitte.
+.
+.\" ─────────────────────────────────────────────────────────────────────────────
+.SH DÉPENDANCES
+.\" ─────────────────────────────────────────────────────────────────────────────
+.B repdem
+ne requiert pas d'installation préalable de paquets supplémentaires pour fonctionner
+en mode diagnostic. Certaines opérations de réparation nécessitent cependant la présence
+des outils correspondants, qui doivent être installés avant lancement.
+
+.SS Outils système essentiels (normalement présents sur tout système Linux)
+.TP
+.BR bash (1)
+version 4.0 ou supérieure.
+.TP
+.BR mount (8) ,\  umount (8)
+montage et démontage des systèmes de fichiers.
+.TP
+.BR blkid (8)
+identification des périphériques blocs (UUID, TYPE, LABEL).
+.TP
+.BR findmnt (8)
+interrogation des points de montage actifs.
+.TP
+.BR lsblk (8)
+énumération de la topologie des périphériques blocs.
+.TP
+.BR fdisk (8) ,\  parted (8)
+lecture de la table de partitions.
+.TP
+.BR chroot (8)
+exécution dans un environnement raciné.
+.TP
+.BR awk (1) ,\  sed (1) ,\  grep (1) ,\  cut (1)
+traitement de texte.
+.TP
+.BR date (1) ,\  basename (1) ,\  dirname (1) ,\  readlink (1)
+utilitaires POSIX de base.
+.TP
+.BR cp (1) ,\  mkdir (1) ,\  chmod (1) ,\  rm (1) ,\  mktemp (1)
+opérations sur le système de fichiers.
+.TP
+.BR hexdump (1)
+ou
+.BR xxd (1)
+lecture des premiers octets d'un périphérique bloc (MBR).
+
+.SS Outils requis selon les opérations de réparation
+.TP
+.BR grub-install (8)
+ou
+.BR grub2-install (8)
+installation du chargeur d'amorçage GRUB. Paquet :
+.B grub-pc
+(BIOS) ou
+.B grub-efi-amd64
+(UEFI) sur Debian/Ubuntu.
+.TP
+.BR update-grub (8)
+ou
+.BR grub-mkconfig (8)
+régénération de la configuration GRUB.
+.TP
+.BR bootctl (1)
+gestion de systemd-boot (fourni par le paquet
+.B systemd
+ou
+.BR systemd-boot-efi ).
+.TP
+.BR mkinitramfs (8)
+ou
+.BR dracut (8)
+ou
+.BR mkinitcpio (8)
+régénération de l'initramfs selon la distribution.
+.TP
+.BR update-initramfs (8)
+enveloppe Debian/Ubuntu pour
+.BR mkinitramfs .
+.TP
+.BR efibootmgr (8)
+manipulation des entrées NVRAM EFI. Paquet :
+.BR efibootmgr .
+.TP
+.BR btrfs (8)
+gestion des sous-volumes Btrfs. Paquet :
+.BR btrfs-progs .
+.TP
+.BR lvm (8) ,\  vgchange (8) ,\  lvscan (8)
+activation des groupes de volumes LVM. Paquet :
+.BR lvm2 .
+.TP
+.BR cryptsetup (8)
+déverrouillage des volumes LUKS. Paquet :
+.BR cryptsetup .
+.TP
+.BR curl (1)
+ou
+.BR wget (1)
+envoi optionnel du rapport Boot-Info vers un paste service.
+.TP
+.BR dpkg (1)
+(Debian/Ubuntu) interrogation de la base des paquets installés.
+.TP
+.BR rpm (8)
+(RHEL/Fedora) interrogation de la base des paquets installés.
+.TP
+.BR pacman (8)
+(Arch) interrogation des paquets installés.
+.TP
+.BR sgdisk (8)
+sauvegarde et restauration de tables GPT binaires. Paquet :
+.BR gdisk .
+.TP
+.BR sfdisk (8)
+sauvegarde et restauration de tables de partitions MBR/GPT. Paquet :
+.BR util-linux .
+.TP
+.BR partprobe (8)
+ou
+.BR blockdev (8)
+rechargement de la table de partitions par le noyau après modification.
+.TP
+.BR mdadm (8)
+gestion et diagnostic des arrays RAID logiciel. Paquet :
+.BR mdadm .
+.TP
+.BR fsck (8)
+vérification et réparation des systèmes de fichiers non montés. Paquet :
+.BR e2fsprogs .
+.TP
+.BR ms-sys (8)
+écriture d'un MBR compatible Windows 7/8/10/11. Paquet :
+.BR ms-sys
+(non présent dans les dépôts officiels Debian/Ubuntu, compilation manuelle ou PPA).
+.TP
+.BR mokutil (1)
+gestion des clés MOK pour Secure Boot. Paquet :
+.BR mokutil .
+.TP
+.BR openssl (1)
+génération de paires de clés RSA-2048 et certificats auto-signés pour l'enrôlement MOK.
+Paquet :
+.BR openssl .
+.TP
+.BR sbsign (1)
+signature de fichiers EFI avec une clé MOK. Paquet :
+.BR sbsigntool .
+.TP
+.BR sbverify (1)
+vérification de signatures EFI. Paquet :
+.BR sbsigntool .
+.TP
+.BR pesign (1)
+alternative à sbsign/sbverify pour la signature et vérification EFI. Paquet :
+.BR pesign .
+.TP
+.BR sbctl (1)
+gestion avancée de Secure Boot (optionnel, détecté si présent).
+.TP
+.BR clevis (1)
+gestion des tokens TPM2 dans les en-têtes LUKS (optionnel, détecté si présent). Paquet :
+.BR clevis .
+.TP
+.BR tpm2_getcap (1)
+interrogation des capacités TPM2 (optionnel). Paquet :
+.BR tpm2-tools .
+.TP
+.BR kernel-install (8)
+réinstallation des entrées BLS noyau (optionnel, RHEL/Fedora). Fourni par
+.BR systemd .
+.TP
+.BR genkernel (8)
+régénération de l'initramfs sur Gentoo. Paquet :
+.BR genkernel .
+.TP
+.BR mkinitrd (8)
+régénération de l'initramfs sur openSUSE. Fourni par
+.BR mkinitrd .
+.TP
+.BR mkinitfs (8)
+régénération de l'initramfs sur Alpine Linux. Fourni par
+.BR mkinitfs .
+.TP
+.BR xbps-reconfigure (8)
+reconfiguration des paquets sur Void Linux. Paquet :
+.BR xbps .
+.TP
+.BR dpkg-deb (1)
+extraction de paquets .deb depuis le cache APT (fallback restauration scripts grub.d). Fourni par
+.BR dpkg .
+.TP
+.BR journalctl (1)
+collecte des erreurs noyau récentes dans les rapports. Fourni par
+.BR systemd .
+.TP
+.BR dmesg (1)
+collecte des messages noyau dans les rapports. Paquet :
+.BR util-linux .
+.TP
+.BR od (1)
+lecture des variables EFI efivars pour détecter l'état Secure Boot. Paquet :
+.BR coreutils .
+.TP
+.BR rsync (1)
+outil recommandé optionnel détecté à l'initialisation en mode Live ISO.
+.TP
+.BR refind-install (8)
+installation de rEFInd. Paquet :
+.BR refind
+(Debian, Arch, RHEL/EPEL).
+.TP
+.BR limine (8)
+installation de Limine BIOS/UEFI. Paquet :
+.BR limine
+(Arch uniquement ; compilation manuelle pour les autres distributions).
+.\" ─────────────────────────────────────────────────────────────────────────────
+.SH EXEMPLES D'UTILISATION
+.\" ─────────────────────────────────────────────────────────────────────────────
+.SS Utilisation basique depuis un système démarré
+
+Lancer le menu interactif principal :
+.RS 4
+.EX
+sudo repdem
+.EE
+.RE
+
+Effectuer la réparation automatique recommandée en 7 étapes :
+.RS 4
+.EX
+sudo repdem --recommended
+.EE
+.RE
+
+Consulter uniquement l'état du système sans rien modifier :
+.RS 4
+.EX
+sudo repdem --analyze
+.EE
+.RE
+
+Exporter le rapport d'analyse dans un fichier :
+.RS 4
+.EX
+sudo repdem --output /root/rapport-boot.txt
+.EE
+.RE
+
+Générer un rapport Boot-Info dans un fichier spécifique :
+.RS 4
+.EX
+sudo repdem --boot-info /root/boot-info.txt
+.EE
+.RE
+
+.SS Utilisation depuis un Live ISO (scénario de dépannage courant)
+
+Démarrer sur un Live ISO Debian ou Ubuntu, ouvrir un terminal, puis :
+.RS 4
+.EX
+# Télécharger le script
+curl -LO https://raw.githubusercontent.com/ps81frt/repdem/main/repdem.sh
+chmod +x repdem.sh
+
+# Lancer la détection automatique et le chroot sur le système installé
+sudo ./repdem.sh --live-chroot
+.EE
+.RE
+
+Le script liste les systèmes Linux détectés sur les disques. Sélectionner le numéro
+correspondant au système à réparer. Le script monte automatiquement les partitions,
+prépare l'environnement chroot et relance la réparation à l'intérieur du système cible.
+
+.SS Réparation manuelle avec options avancées
+
+Pour accéder au menu avancé (14 opérations) :
+.RS 4
+.EX
+sudo repdem --advanced
+.EE
+.RE
+
+Le menu propose notamment : réinstallation de GRUB sur un disque spécifique, purge complète,
+restauration de table de partitions, gestion des entrées EFI via
+.BR efibootmgr ,
+installation de systemd-boot, rEFInd ou Limine, diagnostic de grub.cfg vide,
+Secure Boot et MOK enrollment, et restauration depuis un backup existant.
+
+.SS Cas d'erreur et dépannage
+
+Si le script affiche
+.IR "Ce script doit être exécuté en tant que root" :
+.RS 4
+.EX
+sudo ./repdem.sh --boot
+.EE
+.RE
+
+Si le script affiche
+.IR "Ce script requiert Bash version 4 ou supérieure" ,
+vérifier la version de Bash :
+.RS 4
+.EX
+bash --version
+.EE
+.RE
+
+Pour activer le mode débogage et obtenir une trace détaillée des opérations :
+.RS 4
+.EX
+sudo DEBUG=true repdem --boot
+.EE
+.RE
+
+Pour désactiver les couleurs ANSI (sortie vers un fichier ou terminal ne les supportant pas) :
+.RS 4
+.EX
+sudo NO_COLOR=1 repdem --analyze
+.EE
+.RE
+
+Consulter le journal d'exécution après une session :
+.RS 4
+.EX
+cat /var/log/repdem/Rep-Dem.log
+.EE
+.RE
+.
+.\" ─────────────────────────────────────────────────────────────────────────────
+.SH FICHIERS
+.\" ─────────────────────────────────────────────────────────────────────────────
+.TP
+.I /usr/local/sbin/repdem
+Emplacement recommandé pour l'installation manuelle du script.
+
+.TP
+.I /usr/share/man/man8/repdem.8.gz
+Emplacement de la page de manuel après installation.
+
+.TP
+.I /var/log/repdem/Rep\-Dem.log
+Fichier journal principal. Créé automatiquement lors de la première exécution.
+Droits : 644. Répertoire parent : 755.
+
+.TP
+.I /var/backup/Rep\-Dem\-<AAAAMMJJ_HHMMSS>/
+Répertoire de sauvegarde créé à chaque session modifiant le système. Contient
+les fichiers originaux avant modification, avec reproduction de l'arborescence.
+Droits : 700. Sous-répertoires créés selon les opérations effectuées :
+.IR partition-tables/ ,
+.IR etc/ ,
+.IR boot/ ,
+.IR esp-backup-*.tar.gz ,
+.IR boot-info-pre-repair.txt ,
+.IR boot-info-post-repair.txt .
+
+.TP
+.I /tmp/Rep\-Dem\-*.tmp
+Fichiers temporaires supprimés automatiquement en fin d'exécution via le handler
+de nettoyage (trap EXIT).
+
+.TP
+.I /tmp/Rep\-Dem/<nom_du_script>
+Copie temporaire du script utilisée à l'intérieur du chroot lors de
+.BR \-\-live\-chroot .
+Supprimée à la fin de la session chroot.
+
+.TP
+.I /etc/os-release
+Lu pour la détection de la distribution.
+
+.TP
+.I /etc/fstab
+Lu pour la résolution des partitions séparées lors du montage chroot.
+
+.TP
+.I /etc/crypttab
+Consulté pour détecter la présence de volumes LUKS.
+
+.TP
+.I /boot/grub/grub.cfg
+ou
+.I /boot/grub2/grub.cfg
+Consulté pour la détection du chargeur d'amorçage GRUB.
+
+.TP
+.I /boot/efi/loader/loader.conf
+ou
+.I /efi/loader/loader.conf
+Consulté pour la détection de systemd-boot.
+
+.TP
+.I /sys/firmware/efi
+Vérifié pour déterminer le mode de démarrage (UEFI ou BIOS/Legacy).
+
+.TP
+.I /var/tmp/Rep\-Dem.log ,\  /tmp/Rep\-Dem.log
+Emplacements de repli pour le fichier journal si
+.I /var/log/repdem/
+n'est pas accessible en écriture.
+.
+.TP
+.I /etc/Rep\-Dem/mok/MOK.key
+Clé privée RSA-2048 générée lors de l'enrôlement MOK (option Secure Boot).
+Droits : 600. Répertoire parent : 700.
+
+.TP
+.I /etc/Rep\-Dem/mok/MOK.crt
+Certificat X.509 auto-signé associé à la clé MOK. Généré par
+.BR openssl .
+
+.TP
+.I /etc/Rep\-Dem/mok/MOK.der
+Format DER du certificat, utilisé par
+.BR mokutil
+pour l'enrôlement dans MokManager.
+
+.TP
+.I /etc/dracut.conf.d/99-repdem-crypt.conf
+Fichier de configuration dracut créé automatiquement si LUKS est détecté dans
+.I /etc/crypttab
+et que le module
+.B crypt
+est absent de la configuration dracut existante.
+
+.TP
+.I /etc/dracut.conf.d/99-repdem-clevis.conf
+Fichier de configuration dracut créé si Clevis/TPM2 est détecté, pour inclure
+les modules
+.BR clevis ,
+.BR crypt ,
+.BR tpm2-tss
+dans l'initramfs.
+
+.TP
+.I /mnt/target/
+Point de montage utilisé par
+.B \-\-live\-chroot
+pour monter le système installé sélectionné. Créé automatiquement et démonté
+via le trap EXIT/INT/TERM.
+
+.TP
+.I /etc/default/grub
+Lu et modifié lors de la réparation GRUB (injection de
+.BR rootflags=subvol=
+en cas de Btrfs, ajout d'options noyau, modification du timeout). Sauvegardé avant
+toute modification.
+
+.TP
+.I /etc/grub.d/
+Répertoire des scripts de génération GRUB. Vérifié lors du diagnostic grub-mkconfig ;
+réinstallé depuis le cache APT ou téléchargé si absent ou vide.
+
+.TP
+.I /boot/grub/grub.cfg
+ou
+.I /boot/grub2/grub.cfg
+Régénéré par
+.BR update-grub (8)
+ou
+.BR grub-mkconfig (8)
+lors des opérations de réparation.
+
+.TP
+.I /boot/limine.cfg
+Fichier de configuration Limine généré automatiquement si absent lors de l'installation.
+
+.TP
+.I /boot/efi/loader/loader.conf
+ou
+.I /efi/loader/loader.conf
+Créé par
+.BR bootctl\ install
+lors de la réparation systemd-boot si absent. Contient
+.BR timeout\ 5 ,
+.BR default\ @saved ,
+.BR console-mode\ auto .
+
+.TP
+.I <ESP>/loader/entries/<distro>-<kver>.conf
+Entrée boot systemd-boot créée manuellement via le menu de réparation systemd-boot.
+.\" ─────────────────────────────────────────────────────────────────────────────
+.SS Installation manuelle du script
+
+.RS 4
+.EX
+# Télécharger le script
+curl -LO https://raw.githubusercontent.com/ps81frt/repdem/main/repdem.sh
+
+# Installer dans /usr/local/sbin (réservé aux commandes root)
+sudo install -o root -g root -m 755 repdem.sh /usr/local/sbin/repdem
+.EE
+.RE
+
+.SS Installation de la page de manuel
+
+.RS 4
+.EX
+# Copier et compresser la page de manuel
+sudo install -o root -g root -m 644 repdem.8 /usr/share/man/man8/repdem.8
+sudo gzip -f /usr/share/man/man8/repdem.8
+
+# Mettre à jour la base de données des pages de manuel
+sudo mandb
+
+# Vérifier l'installation
+man repdem
+.EE
+.RE
+
+.SS Test local sans installation
+
+La page de manuel peut être consultée directement sans être installée :
+.RS 4
+.EX
+man ./repdem.8
+.EE
+.RE
+.
+.\" ─────────────────────────────────────────────────────────────────────────────
+.SH DÉSINSTALLATION
+.\" ─────────────────────────────────────────────────────────────────────────────
+Suppression du script et de la page de manuel :
+.RS 4
+.EX
+sudo rm -f /usr/local/sbin/repdem
+sudo rm -f /usr/share/man/man8/repdem.8.gz
+sudo mandb
+.EE
+.RE
+
+Les répertoires et fichiers créés lors des sessions peuvent être supprimés manuellement :
+.RS 4
+.EX
+sudo rm -rf /var/log/repdem/
+sudo rm -rf /var/backup/Rep-Dem-*/
+.EE
+.RE
+
+Ces suppressions sont irréversibles. Vérifier au préalable qu'aucune sauvegarde utile
+ne se trouve dans
+.IR /var/backup/Rep\-Dem\-*/ .
+.
+.\" ─────────────────────────────────────────────────────────────────────────────
+.SH VARIABLES D'ENVIRONNEMENT
+.\" ─────────────────────────────────────────────────────────────────────────────
+.TP
+.B DEBUG
+Si positionné à
+.BR true ,
+active l'affichage et la journalisation des messages de débogage.
+Non défini par défaut.
+
+.TP
+.B NO_COLOR
+Si positionné à
+.BR 1 ,
+désactive les séquences de couleur ANSI dans la sortie standard.
+Voir aussi
+.UR https://no-color.org
+.UE .
+
+.TP
+.B NONINTERACTIVE
+Si positionné à
+.BR true ,
+désactive les demandes de confirmation interactives. Usage interne réservé.
+.
+.\" ─────────────────────────────────────────────────────────────────────────────
+.SH DIAGNOSTICS
+.\" ─────────────────────────────────────────────────────────────────────────────
+Le script retourne les codes de sortie suivants :
+.TP
+.B 0
+Exécution réussie.
+.TP
+.B 1
+Erreur détectée : privilèges insuffisants, version de Bash trop ancienne, option
+inconnue, fichier de sortie manquant, ou échec d'une opération critique.
+
+En cas d'échec, consulter le fichier journal :
+.RS 4
+.EX
+cat /var/log/repdem/Rep-Dem.log
+.EE
+.RE
+.
+.\" ─────────────────────────────────────────────────────────────────────────────
+.SH AVERTISSEMENTS
+.\" ─────────────────────────────────────────────────────────────────────────────
+Ce script modifie des composants critiques du système (chargeur d'amorçage, initramfs,
+table de partitions EFI). Une erreur dans les paramètres fournis peut rendre un système
+non amorçable.
+
+Il est recommandé de :
+.RS 4
+.IP \(bu 2
+effectuer une sauvegarde complète des données importantes avant toute opération de réparation ;
+.IP \(bu 2
+utiliser l'option
+.B \-\-analyze
+pour inspecter l'état du système avant toute intervention ;
+.IP \(bu 2
+disposer d'un support Live ISO fonctionnel en cas d'échec.
+.RE
+
+Les opérations destructives (purge du MBR, réinstallation du bootloader) exigent une
+double confirmation avant exécution.
+.
+.\" ─────────────────────────────────────────────────────────────────────────────
+.SH SAUVEGARDES
+.\" ─────────────────────────────────────────────────────────────────────────────
+À chaque session modifiant le système, un répertoire de sauvegarde horodaté est créé dans
+.IR /var/backup/Rep\-Dem\-<AAAAMMJJ_HHMMSS>/ .
+Il contient selon les opérations effectuées :
+.RS 4
+.IP \(bu 2
+les tables de partitions de chaque disque au format sgdisk (.bin), sfdisk (.dump) et
+dump MBR 512 octets ;
+.IP \(bu 2
+la configuration GRUB :
+.IR /etc/default/grub ,
+.IR /boot/grub/grub.cfg ,
+.IR /etc/grub.d/ ;
+.IP \(bu 2
+une archive tar.gz de la partition EFI (ESP) avant réinstallation de systemd-boot ;
+.IP \(bu 2
+les rapports Boot-Info générés avant et après réparation.
+.RE
+
+Les backups peuvent être restaurés interactivement via le menu avancé, option 13.
+.
+.\" ─────────────────────────────────────────────────────────────────────────────
+.SH UPLOAD DU RAPPORT
+.\" ─────────────────────────────────────────────────────────────────────────────
+L'option
+.B \-\-boot\-info
+et l'option 6 du menu avancé proposent un envoi en ligne du rapport vers trois services
+en parallèle, sans compte requis :
+.TP
+.B paste.ubuntu.com
+Texte, durée indéterminée.
+.TP
+.B dpaste.com
+Texte, durée 7 jours.
+.TP
+.B gofile.io
+Fichier, format quelconque.
+
+L'upload nécessite
+.BR curl (1)
+(préféré) ou
+.BR wget (1)
+et une connexion internet active. Les URLs générées sont affichées à l'écran et
+ajoutées en fin du fichier rapport local.
+.
+.\" ─────────────────────────────────────────────────────────────────────────────
+.SH SECURE BOOT
+.\" ─────────────────────────────────────────────────────────────────────────────
+Le menu avancé (option 11) permet les opérations suivantes relatives au Secure Boot :
+.RS 4
+.IP \(bu 2
+affichage des clés MOK enrôlées (
+.BR mokutil\ \-\-list\-enrolled ) ;
+.IP \(bu 2
+enrôlement d'un certificat existant (.der/.cer) ;
+.IP \(bu 2
+génération d'une paire de clés RSA-2048 auto-signée via
+.BR openssl
+et mise en file d'attente pour MokManager au redémarrage ;
+.IP \(bu 2
+signature manuelle d'un fichier EFI ou module noyau (.ko) via
+.BR sbsign (1)
+ou
+.BR pesign (1) ;
+.IP \(bu 2
+vérification de la signature d'un fichier EFI via
+.BR sbverify (1)
+ou
+.BR pesign .
+.RE
+
+Les clés générées sont stockées dans
+.IR /etc/Rep\-Dem/mok/ .
+L'enrôlement est finalisé au redémarrage via MokManager (interface UEFI).
+.
+.\" ─────────────────────────────────────────────────────────────────────────────
+.SH SYSTÈMES IMMUTABLES
+.\" ─────────────────────────────────────────────────────────────────────────────
+Les distributions basées sur
+.BR rpm-ostree (1)
+(Fedora Silverblue, Kinoite, CoreOS) ou déployées via
+.BR ostree (1)
+(présence de
+.IR /ostree/deploy )
+sont détectées automatiquement. Les opérations de réparation du bootloader et de
+l'initramfs sont bloquées sur ces systèmes car elles sont incompatibles avec le modèle
+immutable. Le script affiche un message d'erreur et indique les commandes
+.BR "rpm-ostree kargs" ,
+.B "rpm-ostree initramfs"
+et
+.B "ostree admin pinned"
+comme alternatives.
+.
+.\" ─────────────────────────────────────────────────────────────────────────────
+.SH ARCHITECTURES SUPPORTÉES
+.\" ─────────────────────────────────────────────────────────────────────────────
+Le script détecte l'architecture via
+.BR uname\ \-m
+et adapte les cibles GRUB et les paquets shim en conséquence :
+.TP
+.B x86_64
+cible GRUB
+.BR x86_64-efi ,
+binaire EFI
+.IR grubx64.efi .
+.TP
+.B aarch64\ /\ arm64
+cible GRUB
+.BR arm64-efi ,
+binaire EFI
+.IR grubaa64.efi .
+Sur certains firmwares ARM (Raspberry Pi Tianocore, Ampere eMAG), une vérification
+de l'offset de la partition EFI est effectuée : si l'ESP démarre au-delà de 256 Mo
+du début du disque, un avertissement est affiché avant de continuer.
+.TP
+.B armv7l\ /\ armhf
+cible GRUB
+.BR arm-efi ,
+binaire EFI
+.IR grubarm.efi .
+.TP
+.B riscv64
+cible GRUB
+.BR riscv64-efi .
+.TP
+.B loongarch64
+cible GRUB
+.BR loongarch64-efi .
+.\" ─────────────────────────────────────────────────────────────────────────────
+.B ps81frt
+.PP
+Dépôt source et suivi des problèmes :
+.UR https://github.com/ps81frt/repdem
+.UE
+.
+.\" ─────────────────────────────────────────────────────────────────────────────
+.SH LICENCE
+.\" ─────────────────────────────────────────────────────────────────────────────
+MIT License. Voir le fichier
+.I LICENSE
+dans le dépôt source.
+.
+.\" ─────────────────────────────────────────────────────────────────────────────
+.SH VOIR AUSSI
+.\" ─────────────────────────────────────────────────────────────────────────────
+.BR bash (1),
+.BR sh (1),
+.BR chroot (8),
+.BR grub-install (8),
+.BR grub-mkconfig (8),
+.BR update-grub (8),
+.BR bootctl (1),
+.BR kernel-install (8),
+.BR efibootmgr (8),
+.BR mkinitramfs (8),
+.BR dracut (8),
+.BR mkinitcpio (8),
+.BR update-initramfs (8),
+.BR blkid (8),
+.BR findmnt (8),
+.BR lsblk (8),
+.BR mount (8),
+.BR btrfs (8),
+.BR lvm (8),
+.BR cryptsetup (8),
+.BR fdisk (8),
+.BR parted (8),
+.BR sgdisk (8),
+.BR sfdisk (8),
+.BR partprobe (8),
+.BR mdadm (8),
+.BR fsck (8),
+.BR mokutil (1),
+.BR openssl (1),
+.BR sbsign (1),
+.BR sbverify (1),
+.BR pesign (1),
+.BR ms-sys (8),
+.BR refind-install (8),
+.BR limine (8),
+.BR clevis (1),
+.BR tpm2_getcap (1),
+.BR journalctl (1),
+.BR dmesg (1),
+.BR dpkg-deb (1),
+.BR curl (1),
+.BR wget (1)
