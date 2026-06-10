@@ -19,7 +19,7 @@
 #         --version       Affiche la version
 #
 #  REQUIREMENTS: Root privileges, bash 4.0+, grub-install ou grub2-install
-#     SUPPORTE:  Debian/Ubuntu/Mint · Fedora/RHEL/Rocky/Alma · Arch/Manjaro
+#     SUPPORTE:  Debian/Ubuntu/Mint · Fedora/RHEL/Rocky/Alma · Arch/Manjaro 
 #                openSUSE · Void Linux · Gentoo
 #        AUTHOR: ps81frt
 #        GITHUB: https://github.com/ps81frt/repdem
